@@ -1,3 +1,4 @@
+#[derive(Debug)]
 pub enum Error {
     HTTPError(reqwest::Error),
     EmptyField,

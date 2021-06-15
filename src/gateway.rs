@@ -1,12 +1,10 @@
 use crate::error::Error;
-use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
-use tokio::net::TcpStream;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use futures_util::{StreamExt,SinkExt};
 
 const API_VERSION: &str = "9";
 const ENCODING: &str = "json";
-const API: &str = "https://discord.com/api";
+const API: &str = "https://discord.com/api/gateway";
 
 async fn _get_gateway_url(v: &str, enc: &str) -> Result<String, Error> {
     let map = reqwest::get(API)
@@ -15,20 +13,18 @@ async fn _get_gateway_url(v: &str, enc: &str) -> Result<String, Error> {
         .await?;
     let mut url = match map.get("url") {
         Some(s) => s.clone(),
-        None => return Err(crate::error::Error::EmptyField),
+        None => return Err(Error::EmptyField),
     };
-    url.push_str("?v=");
+    url.push_str("/?v=");
     url.push_str(v);
     url.push_str("&encoding=");
     url.push_str(enc);
     Ok(url)
 }
 
-trait GatewayEventHandler {}
-struct DefaultHandler {}
-impl GatewayEventHandler for DefaultHandler {}
+pub trait GatewayEventHandler {}
 
-struct Client<T: GatewayEventHandler> {
+pub struct Client<T: GatewayEventHandler> {
     gateway_url: String,
     session_id: String,
     seq_num: Option<usize>,
@@ -57,12 +53,14 @@ impl<T: GatewayEventHandler> Client<T> {
         client.gateway_url = url;
         client.token = token;
 
+        let (mut con,_) = tokio_tungstenite::connect_async(client.gateway_url.clone()).await?;
+
+
         Err(crate::error::Error::EmptyField)
     }
 
-    async fn connection_seq(&self) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Error> {
-        let (mut connection, _) = tokio_tungstenite::connect_async(self.gateway_url).await?;
-
+    async fn connection_seq(&mut self) -> Result<(), Error> {
+        Err(Error::EmptyField)
     }
 
     fn resume_seq(&self) {}
