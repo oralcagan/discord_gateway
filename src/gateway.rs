@@ -1,20 +1,27 @@
 use crate::{
+    api::HTTPClient,
     error::Error,
-    events::{
-        data::{HbACK, Heartbeat, Hello, Identify, IdentifyProperties},
-        IsData, Op, PartialPayload, Payload,
+    events::Ready,
+    payload::{
+        data::{Heartbeat, Hello, Identify, IdentifyProperties},
+        Op, PartialPayload, Payload, PayloadData,
     },
 };
-use futures::stream::{SplitSink, SplitStream};
+use futures::{
+    executor::block_on,
+    future::select,
+    pin_mut,
+    stream::{SplitSink, SplitStream},
+};
 use futures_util::{SinkExt, StreamExt};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{collections::HashMap, convert::TryFrom, sync::Arc, time::Duration};
 use tokio::{
     net::TcpStream,
-    select, spawn,
+    spawn,
     sync::{broadcast, Notify},
-    task::JoinHandle,
-    time::interval,
+    task::{spawn_blocking, JoinHandle},
+    time::sleep,
 };
 use tokio_tungstenite::{
     tungstenite::{
@@ -26,12 +33,13 @@ use tokio_tungstenite::{
 
 const API_VERSION: &str = "9";
 const ENCODING: &str = "json";
-const API: &str = "https://discord.com/api/gateway";
+const API: &str = "https://discord.com/api/";
 const BROADCAST_CAPACITY: usize = 50;
 const GATEWAY_INTENTS: usize = 512;
 
 async fn get_gateway_url(v: &str, enc: &str) -> Result<String, Error> {
-    let map = reqwest::get(API)
+    let api = format!("{}gateway", API);
+    let map = reqwest::get(api)
         .await?
         .json::<HashMap<String, String>>()
         .await?;
@@ -62,6 +70,7 @@ pub struct Client<T: GatewayEventHandler> {
     token: String,
     event_handler: T,
     socket_handler: SocketHandler,
+    httpc: HTTPClient,
 }
 
 impl<T: GatewayEventHandler> Client<T> {
@@ -70,25 +79,23 @@ impl<T: GatewayEventHandler> Client<T> {
             gateway_url: get_gateway_url(API_VERSION, ENCODING).await?,
             session_id: None,
             seq_num: None,
-            token,
+            token: token.clone(),
             event_handler,
             socket_handler: SocketHandler::new(),
+            httpc: HTTPClient::new(token, API_VERSION.to_string(), API.to_string()),
         })
     }
 
     pub async fn run(&mut self) -> Result<(), Error> {
-        self.connection_seq().await?;
+        let mut conn = self.connection_seq().await?;
+
         Ok(())
     }
 
-    async fn connection_seq(&mut self) -> Result<SocketIO, Error> {
+    async fn connection_seq(&mut self) -> Result<GatewayConn, Error> {
         let (w_h, r_h) = self.connect_to_ws().await?;
         let mut io = SocketIO::new(&self.socket_handler);
-        let tasks = SocketTasks {
-            reader: r_h,
-            writer: w_h,
-            writer_ch: self.socket_handler.get_writer(),
-        };
+        let tasks = SocketTasks::new(w_h, r_h, self.socket_handler.get_writer());
 
         let hello = Payload::<Hello>::try_from(&io.r.read().await?.msg)?;
         let hb_not = Arc::new(Notify::new());
@@ -113,10 +120,17 @@ impl<T: GatewayEventHandler> Client<T> {
             Op::Identify,
         );
         io.w.write(identify)?;
-        let msg = wait_for_payload(Op::Dispatch, &mut io).await?;
-        println!("{:?}",msg);
+        let unchecked_ready = io.wait_for_payload(Op::Dispatch).await?;
+        let ready = Payload::<Ready>::try_from(&unchecked_ready.msg)?;
+        self.session_id = Some(ready.d.session_id);
 
-        Err(Error::ChannelClosed)
+        let conn = GatewayConn {
+            heartbeat_h: hearbeat_handle,
+            io: SocketIO::new(&self.socket_handler),
+            tasks: tasks,
+        };
+
+        Ok(conn)
     }
 
     async fn connect_to_ws(&self) -> Result<(JoinHandle<()>, JoinHandle<()>), Error> {
@@ -134,7 +148,7 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 type SocketMsg = Message;
 
-impl<T: IsData + DeserializeOwned> TryFrom<&SocketMsg> for Payload<T> {
+impl<T: PayloadData + DeserializeOwned> TryFrom<&SocketMsg> for Payload<T> {
     type Error = Error;
 
     fn try_from(value: &SocketMsg) -> Result<Self, Self::Error> {
@@ -145,7 +159,7 @@ impl<T: IsData + DeserializeOwned> TryFrom<&SocketMsg> for Payload<T> {
     }
 }
 
-impl<T: IsData + Serialize> TryFrom<&Payload<T>> for SocketMsg {
+impl<T: PayloadData + Serialize> TryFrom<&Payload<T>> for SocketMsg {
     type Error = Error;
 
     fn try_from(p: &Payload<T>) -> Result<Self, Self::Error> {
@@ -198,28 +212,35 @@ impl SocketHandler {
 
     async fn run_reader(&self, mut reader: SplitStream<WsStream>) -> JoinHandle<()> {
         let broadcaster = self.get_broadcaster();
-        spawn(async move {
-            while let Some(res) = reader.next().await {
-                match res {
-                    Ok(msg) => {
-                        broadcaster.send(Message::Text(msg.to_string()));
+        spawn_blocking(move || {
+            let handle = spawn(async move {
+                while let Some(res) = reader.next().await {
+                    match res {
+                        #[allow(unused_must_use)]
+                        Ok(msg) => {
+                            broadcaster.send(msg);
+                        }
+                        Err(err) => match err {
+                            tokio_tungstenite::tungstenite::Error::Capacity(_) => (),
+                            _ => panic!("Reader - Socket error: {}", err),
+                        },
                     }
-                    Err(err) => match err {
-                        tokio_tungstenite::tungstenite::Error::Capacity(_) => (),
-                        _ => panic!("Fatal: {}", err),
-                    },
                 }
-            }
+            });
+            block_on(handle);
         })
     }
 
     async fn run_writer(&self, mut writer: SplitSink<WsStream, Message>) -> JoinHandle<()> {
         let mut listener = self.listen_writer();
-        spawn(async move {
-            loop {
-                let msg = listener.recv().await.expect("Fatal");
-                writer.send(msg).await.expect("Fatal");
-            }
+        spawn_blocking(move || {
+            let handle = spawn(async move {
+                loop {
+                    let msg = listener.recv().await.expect("Writer - all senders closed");
+                    writer.send(msg).await.expect("Writer - Socket error ");
+                }
+            });
+            block_on(handle);
         })
     }
 }
@@ -233,7 +254,7 @@ impl MsgWriter {
         Self { writer }
     }
 
-    fn write<T: IsData + Serialize>(&self, p: Payload<T>) -> Result<(), Error> {
+    fn write<T: PayloadData + Serialize>(&self, p: Payload<T>) -> Result<(), Error> {
         self.writer.send(Message::Text(String::from(p)))?;
         Ok(())
     }
@@ -242,7 +263,7 @@ impl MsgWriter {
 #[derive(Debug)]
 struct IncomingMsg {
     pp: PartialPayload,
-    msg: Message,
+    msg: SocketMsg,
 }
 
 struct MsgReader {
@@ -268,13 +289,18 @@ struct SocketIO {
 
 impl SocketIO {
     fn new(sh: &SocketHandler) -> Self {
-        let w = MsgWriter {
-            writer: sh.get_writer(),
-        };
-        let r = MsgReader {
-            reader: sh.subscribe(),
-        };
+        let w = MsgWriter::new(sh.get_writer());
+        let r = MsgReader::new(sh.subscribe());
         SocketIO { w, r }
+    }
+
+    async fn wait_for_payload(&mut self, op: Op) -> Result<IncomingMsg, Error> {
+        loop {
+            let p = self.r.read().await?;
+            if op == p.pp.op {
+                return Ok(p);
+            }
+        }
     }
 }
 
@@ -282,48 +308,75 @@ struct SocketTasks {
     writer: JoinHandle<()>,
     reader: JoinHandle<()>,
     writer_ch: broadcast::Sender<SocketMsg>,
+    closed: bool,
+}
+
+impl SocketTasks {
+    fn new(
+        writer: JoinHandle<()>,
+        reader: JoinHandle<()>,
+        writer_ch: broadcast::Sender<SocketMsg>,
+    ) -> Self {
+        Self {
+            closed: false,
+            reader: reader,
+            writer: writer,
+            writer_ch: writer_ch,
+        }
+    }
+
+    fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.writer_ch.send(close_msg(CloseCode::Normal));
+        self.reader.abort();
+        self.closed = true;
+    }
 }
 
 impl Drop for SocketTasks {
     fn drop(&mut self) {
-        self.writer_ch.send(close_msg(CloseCode::Normal));
-        self.reader.abort();
+        self.close();
     }
 }
 
 fn make_hearbeat(intv: usize, mut io: SocketIO, notify: Arc<Notify>) -> JoinHandle<()> {
     spawn(async move {
-        let mut interval = interval(Duration::from_millis(intv as u64));
-        interval.tick().await;
+        let dur = Duration::from_millis(intv as u64);
         loop {
             io.w.write(Payload::<Heartbeat>::new(None, None, None, Op::Heartbeat))
-                .expect("Fatal");
-            let waiter = wait_for_payload(Op::Heartbeat, &mut io);
-            let tick = interval.tick();
-            loop {
-                select! {
-                    r = waiter => {
-                        if r.is_err() {
-                            notify.notify_one();
-                            panic!("Fatal")
-                        }
-                        break
-                    },
-                    _ = tick => {
+                .expect("Heartbeat - Socket write error");
+            let waiter = io.wait_for_payload(Op::HbACK);
+            let tick = sleep(dur);
+
+            pin_mut!(waiter);
+            pin_mut!(tick);
+            match select(waiter, tick).await {
+                futures::future::Either::Left((a, b)) => {
+                    if a.is_err() {
                         notify.notify_one();
-                        panic!("Fatal")
+                        panic!("Heartbeat - Socket read error: {:?}", a)
                     }
+                    b.await;
+                }
+                futures::future::Either::Right(_) => {
+                    notify.notify_one();
+                    panic!("Heartbeat - ACK timeout")
                 }
             }
         }
     })
 }
 
-async fn wait_for_payload(op: Op, io: &mut SocketIO) -> Result<IncomingMsg, Error> {
-    loop {
-        let p = io.r.read().await?;
-        if op == p.pp.op {
-            return Ok(p);
-        }
+struct GatewayConn {
+    tasks: SocketTasks,
+    io: SocketIO,
+    heartbeat_h: JoinHandle<()>,
+}
+
+impl Drop for GatewayConn {
+    fn drop(&mut self) {
+        self.heartbeat_h.abort();
     }
 }
